@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
@@ -49,7 +50,7 @@ func main() {
 
 func run() int {
 	var (
-		addr    = flag.String("addr", ":8787", "HTTP listen address")
+		addr    = flag.String("addr", "127.0.0.1:8787", "HTTP listen address")
 		dataDir = flag.String("data", filepath.Join(config.BaseDir(), "data"), "data directory for SQLite stores (default: data/ next to the executable)")
 		proxy   = flag.String("proxy", "127.0.0.1:8788", "traffic recording proxy address (empty to disable)")
 	)
@@ -88,12 +89,35 @@ func run() int {
 	}
 	defer mgr.Close()
 
-	skillDir := config.SkillDir()
+	skillDir, err := config.SkillDir()
+	if err != nil {
+		log.Printf("[config] %v", err)
+		return 1
+	}
 	if abs, err := filepath.Abs(skillDir); err == nil {
 		skillDir = abs
 	}
 	log.Printf("[config] skill directory: %s", skillDir)
-	srv := server.New(ctx, mgr, skillDir, *dataDir, config.BaseDir())
+	// JWT signing key directory: ARTEX_JWT_KEY_DIR (the Docker image points it at
+	// the /app/keys volume) or the base dir. Never the browsable data dir.
+	keyDir := strings.TrimSpace(os.Getenv("ARTEX_JWT_KEY_DIR"))
+	if keyDir == "" {
+		keyDir = config.BaseDir()
+	}
+	if abs, err := filepath.Abs(keyDir); err == nil {
+		keyDir = abs
+	}
+	log.Printf("[config] JWT key directory: %s", keyDir)
+	// Proxies whose X-Forwarded-For the login rate limit reads; empty trusts none.
+	trusted, err := server.ParseTrustedProxies(os.Getenv("ARTEX_TRUSTED_PROXIES"))
+	if err != nil {
+		log.Printf("[config] ARTEX_TRUSTED_PROXIES: %v", err)
+		return 1
+	}
+	if len(trusted) > 0 {
+		log.Printf("[config] trusted proxies: %v", trusted)
+	}
+	srv := server.New(ctx, mgr, skillDir, *dataDir, keyDir, server.WithSecretScrub(), server.WithTrustedProxies(trusted))
 	httpSrv := &http.Server{
 		Addr:              *addr,
 		Handler:           srv.Handler(),

@@ -9,6 +9,8 @@ AI autonomous penetration testing system (Go backend + Next.js frontend)
 
 </div>
 
+<a href="https://trendshift.io/repositories/316805?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-316805" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/316805/daily?language=Go" alt="BaaRai%2FARTEX | Trendshift" width="250" height="55"/></a>
+
 ---
 
 ## Screenshots
@@ -84,10 +86,13 @@ cd ARTEX
 
 The script will: detect / auto-install Docker → then let you choose **① all-Docker** or **② local build and run**:
 
-- **① All-Docker**: enter a Postgres password (press Enter for a random one) → auto-writes `.env` → `docker compose up -d`.
+- **① All-Docker**: enter a Postgres password (press Enter for a random one) → auto-writes `.env` → `docker compose up -d --build` (the image is built from this checkout).
 - **② Local run**: choose a database (connect to an existing one / start one with Docker) → generates `config.json` → `go` builds the embedded single binary → starts.
 
 Once installed, open **http://localhost:8787** (on first entry, `/setup` sets the admin password).
+`/setup` asks for a one-time setup token: while no password is set, the backend prints it at startup in its log (`docker compose logs artex | grep "Setup token"`, or the terminal running `./start.sh`).
+
+The web UI is published on `127.0.0.1` by default. To reach it from another machine, or from Windows when ARTEX runs inside WSL, set `ARTEX_BIND_ADDR=0.0.0.0` in `.env` (the setup token still protects the first-run claim), or keep loopback and use a reverse proxy or an SSH tunnel.
 
 ### Option 2: Docker Compose (manual)
 
@@ -95,9 +100,12 @@ Once installed, open **http://localhost:8787** (on first entry, `/setup` sets th
 git clone https://github.com/BaaRai/ARTEX.git
 cd ARTEX
 cp .env.example .env          # set POSTGRES_PASSWORD, optionally ANTHROPIC_API_KEY
-docker compose up -d          # pulls the autumn27/artex image + postgres
+docker compose up -d --build  # builds artex from this checkout + starts postgres
 # → http://localhost:8787
 ```
+
+> The image is built locally. There is no published image to pull: the previous
+> default pointed at a third-party namespace that no longer hosts this project.
 
 The image already includes common tools (ripgrep/curl/vim/npm/nmap…); `./skills` and `./data` are persisted via bind mounts.
 
@@ -173,7 +181,20 @@ Daily cron example (03:20, operator crontab):
 
 ## Updating and upgrading
 
-> Upgrading only swaps the program and never touches data: the Postgres volume `pgdata`, `./data` (jwt.key / SQLite, etc.), and `./skills` are all preserved. **No manual database migration is needed**: `artex` idempotently re-runs `schema.sql` on every start (with `ADD COLUMN` / `CREATE INDEX IF NOT EXISTS`), i.e. "restart equals migrate". It is still recommended to back up `./data` and the database before upgrading.
+> Upgrading only swaps the program and never touches data: the Postgres volume `pgdata`, `./data` (SQLite, task files, etc.), `./keys` (jwt.key), and `./skills` are all preserved. **No manual database migration is needed**: `artex` idempotently re-runs `schema.sql` on every start (with `ADD COLUMN` / `CREATE INDEX IF NOT EXISTS`), i.e. "restart equals migrate". It is still recommended to back up `./data` and the database before upgrading.
+
+### Upgrading from a clone made before 2026-10-23
+
+The repository history was rewritten that day to drop a personal email address from the commit metadata. A clone made before then cannot fast-forward, and `./update.sh` now stops instead of silently rebuilding stale code. Recover once, then upgrade normally:
+
+```bash
+git stash                 # only if you have local changes
+git fetch origin
+git reset --hard origin/main
+git stash pop             # only if you stashed
+```
+
+Your data is not affected: `./data`, the `pgdata` volume and `./skills` are not part of the git history.
 
 ### Option 1: one-click update script
 
@@ -184,17 +205,16 @@ cd ARTEX
 
 The script first optionally `git pull`s the latest code, then lets you choose **① Docker update** or **② local build update** (matching `install.sh`):
 
-- **① Docker**: you can specify a target image tag (press Enter to keep `.env`'s `ARTEX_TAG`, default `latest`) → `docker compose pull` → `docker compose up -d` (restarting with the new image migrates automatically).
+- **① Docker**: rebuilds the image from this checkout → `docker compose build artex` → `docker compose up -d artex` (restarting migrates the schema automatically).
 - **② Local**: rebuild the frontend static assets → recompile `./artex` (restart the process for it to take effect).
 
 ### Option 2: Docker Compose (manual)
 
 ```bash
 cd ARTEX
-git pull                       # update compose / scripts (optional)
-# pin a version: set ARTEX_TAG=v0.2.0 in .env; otherwise latest is used
-docker compose pull artex
-docker compose up -d artex     # restart with the new image → schema migrates automatically
+git pull                       # update compose / scripts
+docker compose build artex     # rebuild the image from this checkout
+docker compose up -d artex     # recreate the container → schema migrates automatically
 docker image prune -f          # clean up old images (optional)
 ```
 
@@ -233,8 +253,8 @@ CGO_ENABLED=0 go build -tags embedui -o artex ./cmd/artex
 }
 ```
 
-**LLM**: `export ANTHROPIC_API_KEY=sk-...` (or `OPENAI_API_KEY`); you can also fill it in on the UI's "LLM Configuration" page.
-Optional: `ARTEX_LLM_PROVIDER` / `ARTEX_LLM_MODEL` / `ARTEX_LLM_BASE_URL` / `ARTEX_LLM_PROXY`.
+**LLM**: `export ANTHROPIC_API_KEY=sk-...` (or `OPENAI_API_KEY`); you can also fill it in on the UI's "LLM Configuration" page — which can add a local Ollama server as a keyless provider (format "Ollama", base URL default `http://127.0.0.1:11434/v1`, models loaded from the server).
+Optional: `ARTEX_LLM_PROVIDER` (anthropic | openai | openai-responses | ollama) / `ARTEX_LLM_MODEL` / `ARTEX_LLM_BASE_URL` / `ARTEX_LLM_PROXY`.
 
 **Concurrency**: the number of work agents per task is configured in "System Settings" (default 3).
 
@@ -242,7 +262,7 @@ Optional: `ARTEX_LLM_PROVIDER` / `ARTEX_LLM_MODEL` / `ARTEX_LLM_BASE_URL` / `ART
 
 ### Reverse proxy deployment (HTTPS / only exposing 443)
 
-The frontend and API/SSE are served by the same backend port (default `:8787`), and the realtime activity stream uses the **same-origin** address by default, so **there is no need to configure `NEXT_PUBLIC_SSE_BASE`**: just expose 443 publicly and keep 8787 on the internal network.
+The frontend and API/SSE are served by the same backend port (8787; the binary listens on `127.0.0.1:8787` by default, the Docker container on `:8787` published on `127.0.0.1`), and the realtime activity stream uses the **same-origin** address by default, so **there is no need to configure `NEXT_PUBLIC_SSE_BASE`**: just expose 443 publicly and keep 8787 on the internal network.
 
 SSE is a long-lived connection with continuous pushes, so the reverse proxy **must disable buffering**, otherwise the browser connects but never receives events (the activity stream spins forever). Nginx example:
 
@@ -256,6 +276,7 @@ server {
         proxy_pass http://127.0.0.1:8787;
         proxy_set_header Host $host;
         proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
 
         # SSE essentials: buffering off, long timeouts, HTTP/1.1
         proxy_buffering off;
@@ -266,6 +287,13 @@ server {
     }
 }
 ```
+
+**Login rate limit behind a proxy**: login allows 10 attempts per minute per client IP. Behind a proxy every request comes from the proxy's address, so without further setup all users share one budget and an attacker who fails 10 logins blocks everyone, admin included, for up to 15 minutes. To avoid that, keep the `X-Forwarded-For` line above and set `ARTEX_TRUSTED_PROXIES` (comma-separated CIDRs, empty by default) to the address ARTEX sees the proxy connect from:
+
+- **nginx and ARTEX both on the host** (binary, `./start.sh`): the peer is `127.0.0.1`. Start ARTEX with `ARTEX_TRUSTED_PROXIES=127.0.0.1/32`.
+- **nginx on the host, ARTEX in Docker** (`docker-compose.yml`): the connection reaches the container from the Docker bridge gateway (a `172.x` address), not from `127.0.0.1`. Find it with `docker network inspect artex_default --format '{{(index .IPAM.Config 0).Gateway}}'` (the network is `<project directory>_default`; `docker network ls` lists it), put `ARTEX_TRUSTED_PROXIES=<gateway>/32` in `.env`, and run `docker compose up -d`.
+
+For a peer in that list, ARTEX reads `X-Forwarded-For` from the right and takes the first address that is not a trusted proxy; from any other peer the header is ignored. Trust only addresses of proxies you run: a trusted peer can claim any client address.
 
 > Only when SSE needs a different origin from the page (e.g. a dedicated subdomain) should you set `NEXT_PUBLIC_SSE_BASE` **at build time** (this variable is baked into the static bundle during `next build`; setting it at container runtime has no effect).
 

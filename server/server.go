@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -44,7 +45,15 @@ type Server struct {
 	ctx    context.Context
 
 	skillDir string // root directory for skill subdirectories
-	jwtKey   []byte // HS256 signing key loaded from / generated into dataDir/jwt.key
+	jwtKey   []byte // HS256 signing key loaded from / generated into keyDir/jwt.key
+
+	scrubSecrets bool // drop ARTEX_PG_DSN and the API keys from the environment once read (binary only)
+
+	setupMu    sync.Mutex
+	setupToken string // one-time token POST /api/auth/init requires; empty when none is active
+
+	loginLimit     *loginLimiter  // per-IP attempt limit on POST /api/auth/login
+	trustedProxies []netip.Prefix // ARTEX_TRUSTED_PROXIES; see clientIP
 
 	// concMu serializes concurrency-cap decisions (admission + reconcile) so a
 	// scheduler tick and an HTTP settings change / task creation can't both count
@@ -140,7 +149,7 @@ type triggeredRun struct {
 	mergeable bool   // true for finding/goal event triggers (merge by taskID)
 }
 
-func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDir string) *Server {
+func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDir string, opts ...Option) *Server {
 	key, err := loadOrCreateJWTKey(keyDir, dataDir)
 	if err != nil {
 		log.Fatalf("[auth] JWT key: %v", err)
@@ -150,7 +159,12 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		triggerActive: map[string]int{}, triggerCfg: map[string]triggerBehavior{},
 		profChatAgents: map[int64]*agent.ChatAgent{},
 		provByProfile:  map[int64]*provEntry{}, llmHealth: newLLMHealthRegistry(m.pg),
-		taskAgents: map[string]*taskAgentBundle{}, archiveWake: make(chan struct{}, 1)}
+		taskAgents: map[string]*taskAgentBundle{}, archiveWake: make(chan struct{}, 1),
+		loginLimit: newLoginLimiter(time.Now)}
+	for _, o := range opts {
+		o(s)
+	}
+	s.initSetupToken()
 	s.initSideQuestions()
 	// Circuit-breaker thresholds/cooldowns are hot parameters on the failure path; push the global retry policy to the Registry once at startup,
 	// and again on every policy save (saveLLMRetryPolicy).
@@ -232,9 +246,6 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		// Vulnerability IM push delivery engine. Sits beside the Scheduler but independent: push latency demands (3s)
 		// differ from the triggers' business cadence, and neither's failures drag the other down — a stuck push must not affect agent triggers.
 		go newNotifier(s).Run(s.ctx)
-		// Fill the tool cache for any enabled MCP that has none yet (notably the
-		// seeded browser MCP on first run). Async so it never blocks startup.
-		go s.discoverEmptyMCPsOnStartup()
 		logSink.SetDB(ctx, m.pg) // restore last 100 log rows and enable async persistence
 	}
 	// precedence: persisted DB config > env.
@@ -253,6 +264,16 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	} else {
 		log.Printf("[engine] no LLM provider configured — engine idle until set via /api/llm or env")
 	}
+	// Both env readers have now run (NewManager for the DSN, FromEnv above for the
+	// keys). Drop the secrets before anything below can spawn a child process:
+	// restoring runtimes resumes workers that run shells, and MCP discovery starts
+	// stdio servers.
+	if s.scrubSecrets {
+		ScrubSecretEnv()
+	}
+	// Fill the tool cache for any enabled MCP that has none yet (notably the
+	// seeded browser MCP on first run). Async so it never blocks startup.
+	go s.discoverEmptyMCPsOnStartup()
 	s.restoreTaskRuntimes()
 	go s.reconcileConcurrency()
 	s.startTaskArchiveWorker()
@@ -335,7 +356,8 @@ func (s *Server) loadLLMConfig() (agent.Config, bool) {
 	cfg.MaxTokens, cfg.MaxTokensField = p.MaxTokens, p.MaxTokensField
 	cfg.SessionHeaderKey = p.SessionHeaderKey
 	s.applyProfileRetry(&cfg, p)
-	if cfg.APIKey == "" {
+	// Ollama profiles run keyless (local server); the other formats need a key.
+	if cfg.APIKey == "" && cfg.NeedsAPIKey() {
 		return cfg, false
 	}
 	s.cfgMu.Lock()
@@ -491,7 +513,8 @@ func (s *Server) applyLLM(cfg agent.Config) error {
 }
 
 // loadProfileConfig builds an agent.Config from a specific profile id (with its key).
-// ok=false when the profile is missing or has no api key.
+// ok=false when the profile is missing or unusable (no api key for the key-requiring
+// formats).
 func (s *Server) loadProfileConfig(id int64) (agent.Config, bool) {
 	p, err := s.m.pg.ProfileByID(id)
 	if err != nil || p == nil {
@@ -506,7 +529,7 @@ func (s *Server) loadProfileConfig(id int64) (agent.Config, bool) {
 	cfg.MaxTokens, cfg.MaxTokensField = p.MaxTokens, p.MaxTokensField
 	cfg.SessionHeaderKey = p.SessionHeaderKey
 	s.applyProfileRetry(&cfg, p)
-	if cfg.APIKey == "" {
+	if cfg.APIKey == "" && cfg.NeedsAPIKey() {
 		return cfg, false
 	}
 	return cfg, true
@@ -946,7 +969,14 @@ func (s *Server) Handler() http.Handler {
 
 // --- handlers ---
 
+// health answers without a token (requireAuth exempts it), but only a caller
+// with a valid token gets the service name and version; the web UI's top bar
+// reads the version, and sends its token.
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
+	if !verifyJWT(extractToken(r), s.jwtKey) {
+		writeJSON(w, 200, map[string]any{"ok": true})
+		return
+	}
 	writeJSON(w, 200, map[string]any{"ok": true, "service": "artex", "version": BuildVersion})
 }
 
@@ -1343,12 +1373,13 @@ func (s *Server) setLLM(w http.ResponseWriter, r *http.Request) {
 		}
 		cfg.ContextWindowK = k
 	}
-	if cfg.APIKey == "" {
+	// Keyless formats (Ollama) need no key; the others keep/require one.
+	if cfg.APIKey == "" && cfg.NeedsAPIKey() {
 		s.cfgMu.Lock()
 		cfg.APIKey = s.llmCfg.APIKey // keep existing key if not re-entered
 		s.cfgMu.Unlock()
 	}
-	if cfg.APIKey == "" {
+	if cfg.APIKey == "" && cfg.NeedsAPIKey() {
 		writeErr(w, 400, "api_key required")
 		return
 	}
@@ -1441,28 +1472,49 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 	// see TestConnection). Endpoints like opencode zen that mandate x-opencode-session return
 	// 400 without it, so the test path must send it too — otherwise "chat works, test 400s".
 	cfg.SessionHeaderKey = req.SessionHeaderKey
-	// API key resolution precedence: form input > the named profile's stored key > the global config's key.
-	// A stored profile's key is never sent back to the browser, so the form is empty when testing a stored profile and the key comes from the DB.
-	// Same for the session header name: when the form omits it, the stored profile's value is the fallback.
-	if stored != nil && (cfg.APIKey == "" || cfg.SessionHeaderKey == "") {
-		// Trim like ConfigFrom does for form values: a key stored with
-		// surrounding whitespace runs fine in conversations (the runtime
-		// path re-trims) but would be sent raw here and fail auth.
+	// The custom session header name follows that profile regardless of format:
+	// when the form omits it, the stored profile's value is the fallback.
+	if stored != nil && cfg.SessionHeaderKey == "" {
+		cfg.SessionHeaderKey = strings.TrimSpace(stored.SessionHeaderKey)
+	}
+	// Keyless formats (Ollama) skip the key resolution entirely.
+	if cfg.NeedsAPIKey() {
+		// API key resolution precedence: form input > the named profile's stored key > the global config's key.
+		// A stored profile's key is never sent back to the browser, so the form is empty when testing a stored profile and the key comes from the DB.
+		// A saved key is only sent to the endpoint it was saved for: base_url and
+		// provider come from the form, so without this check the test button sends
+		// the saved key to any host typed into the form.
+		withheld := false
+		if stored != nil && cfg.APIKey == "" {
+			if sameLLMEndpoint(req.Provider, req.BaseURL, stored.Format, stored.BaseURL) {
+				// Trim like ConfigFrom does for form values: a key stored with
+				// surrounding whitespace runs fine in conversations (the runtime
+				// path re-trims) but would be sent raw here and fail auth.
+				cfg.APIKey = strings.TrimSpace(stored.APIKey)
+			} else {
+				withheld = true
+			}
+		}
 		if cfg.APIKey == "" {
-			cfg.APIKey = strings.TrimSpace(stored.APIKey)
+			s.cfgMu.Lock()
+			global := s.llmCfg
+			s.cfgMu.Unlock()
+			if global.APIKey != "" {
+				if sameLLMEndpoint(req.Provider, req.BaseURL, global.Provider(), global.BaseURL) {
+					cfg.APIKey = global.APIKey
+				} else {
+					withheld = true
+				}
+			}
 		}
-		if cfg.SessionHeaderKey == "" {
-			cfg.SessionHeaderKey = strings.TrimSpace(stored.SessionHeaderKey)
+		if cfg.APIKey == "" {
+			msg := "no API key provided"
+			if withheld {
+				msg = "no API key provided: the saved key is only sent to the endpoint it was saved for; enter the key to test a different base URL or provider"
+			}
+			writeJSON(w, 200, map[string]any{"ok": false, "error": msg})
+			return
 		}
-	}
-	if cfg.APIKey == "" {
-		s.cfgMu.Lock()
-		cfg.APIKey = s.llmCfg.APIKey
-		s.cfgMu.Unlock()
-	}
-	if cfg.APIKey == "" {
-		writeJSON(w, 200, map[string]any{"ok": false, "error": "no API key provided"})
-		return
 	}
 	// Retry params do [not] go into the connection test: the test has a 30s hard timeout, and stacking the configured retry counts/long intervals on top
 	// would only turn a perfectly usable endpoint into a "timeout failure". The test asks "does this endpoint work at all"; retry pacing
@@ -1476,6 +1528,16 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{
 		"ok": true, "latency_ms": lat.Milliseconds(), "model": cfg.Model, "reply": truncateReply(reply),
 	})
+}
+
+// sameLLMEndpoint reports whether two provider/base URL pairs resolve to the same
+// endpoint after ConfigFrom's normalization (trimmed, endpoint suffix stripped;
+// an empty base URL means the provider's canonical host). A saved API key may only
+// be sent when the request's endpoint matches the one it was saved for.
+func sameLLMEndpoint(provA, baseA, provB, baseB string) bool {
+	a := agent.ConfigFrom(provA, "", baseA, "", "")
+	b := agent.ConfigFrom(provB, "", baseB, "", "")
+	return a.Format == b.Format && a.BaseURL == b.BaseURL
 }
 
 // truncateReply clips a connection-test reply for display. A model told to answer
@@ -1621,7 +1683,7 @@ func (s *Server) validateTaskProfileIDs(ids []int64) error {
 		}
 		seen[id] = true
 		if _, ok := s.loadProfileConfig(id); !ok {
-			return fmt.Errorf("LLM profile #%d not found or has no API key set", id)
+			return fmt.Errorf("LLM profile #%d not found or not usable (no API key for the key-requiring formats)", id)
 		}
 	}
 	return nil

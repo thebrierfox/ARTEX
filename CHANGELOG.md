@@ -2,7 +2,76 @@
 
 All notable changes to this project are documented in this file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [0.5.1] - 2026-11-05
+
+Login rate limiting per client IP with trusted-proxy support, a 12-character minimum for new passwords, a loopback-only default for the binary, and the JWT signing key in its own Docker volume.
+
+### Changed
+
+- **The binary listens on `127.0.0.1:8787` by default**: the `-addr` default was `:8787`, every interface. Running `artex` or `./start.sh` without `-addr` now accepts connections from the local machine only; pass `-addr :8787` to listen on every interface. Docker is unchanged: the image starts the server with `-addr :8787` inside the container, and `docker-compose.yml` already publishes it on `127.0.0.1` by default (`ARTEX_BIND_ADDR`).
+- **New passwords need at least 12 characters** (was 8), at first-run setup (`POST /api/auth/init` and the `/setup` page) and in `POST /api/auth/change-password`. Login does not check length, so a password set under the old minimum keeps working until it is changed. `reset-password.sh` enforces the same minimum.
+
+### Fixed
+
+- **The JWT signing key survives container rebuilds**: the server wrote `jwt.key` to the executable's directory, `/app` in the image, so the key lived in the container's writable layer and recreating the container (for example `docker compose up -d --build`) generated a new key and signed every user out. The key directory is now set by `ARTEX_JWT_KEY_DIR` (default: the executable's directory, unchanged for non-Docker installs). `docker-compose.yml` sets it to `/app/keys` and bind-mounts `./keys` there, outside `./data`, which the file manager browses. On start, when `<key dir>/jwt.key` is missing, a key at `data/jwt.key`, then at the executable's directory, is copied there with mode 0600 and the old file is removed; otherwise a new key is generated. An existing key is never overwritten. Upgrading a Docker install signs every user out once, because the old key is in the container being replaced; to keep sessions, copy it out before recreating the container:
+
+  ```bash
+  mkdir -p keys
+  docker cp artex-artex-1:/app/jwt.key ./keys/jwt.key
+  ```
+
+### Security
+
+- **Login rate limit**: `POST /api/auth/login` allows 10 attempts per minute per client IP. The next attempt gets 429 with a `Retry-After` header (seconds) and a JSON error, and the IP is blocked for 1 minute. Each attempt while blocked, and each later block, doubles the wait, up to 15 minutes. A successful login clears the IP's count. There is no per-account lockout, so failing logins cannot lock the admin out from other addresses. The state is in memory: a restart clears it, an IP idle for 15 minutes is dropped, and at most 10,000 IPs are tracked (the least recently seen is dropped first). The IP is the TCP peer address, and `X-Forwarded-For` is ignored, unless the peer is listed in the new `ARTEX_TRUSTED_PROXIES` (comma-separated CIDRs, empty by default, passed through by `docker-compose.yml`). For a listed peer the header is read from the right and the first address that is not a trusted proxy is the client; entries the client added further left are never used. Behind a reverse proxy, set it: otherwise every client has the proxy's address and shares one budget, and an attacker failing logins through the proxy blocks the real users, admin included, for up to 15 minutes. The README nginx example now sends `X-Forwarded-For`.
+- **`GET /api/health` hides the version from anonymous callers**: without a valid token it answers `{"ok":true}` only. With a token (the web UI sends one for the version in its top bar) the answer is unchanged: `ok`, `service` and `version`.
+
+## [0.5.0] - 2026-11-04
+
+Ollama support, a setup token for the first-run claim, secret scrubbing for child processes, a Docker image that builds from a fresh clone, Go 1.26.10 and Node 22, and race and shellcheck runs in CI. Entries marked "direct commit" landed on `main` without a pull request.
+
+### Added
+
+- **Ollama support**: an `ollama` LLM profile format for a local or LAN Ollama server. Keyless by design: no API key is needed, `OPENAI_API_KEY` is never inherited, the base URL defaults to `http://127.0.0.1:11434/v1` and is normalized to the `/v1` root, and the profile works in the failover pool, task LLM chains, model listing and connection tests. Contributed by @glauberportella (#128).
+- **Setup token for first-run setup**: while no admin password is set, the server generates a random 128-bit one-time token at startup and prints it to its log (`docker compose logs artex | grep "Setup token"`). The `/setup` page has a field for it, `POST /api/auth/init` requires it (`setup_token`, compared in constant time, 403 when missing or wrong), and it is cleared once the password is stored (#137).
+- **`ARTEX_BIND_ADDR`**: the address `docker-compose.yml` publishes the web UI on, default `127.0.0.1` (#137).
+
+### Security
+
+- **First-run claim**: before, anyone who reached port 8787 on a fresh install before the operator could set the admin password. Init now needs the setup token above, and Docker installs publish 8787 on `127.0.0.1` by default; set `ARTEX_BIND_ADDR=0.0.0.0` in `.env`, or use a reverse proxy or SSH tunnel, for remote access (#137).
+- **Startup secrets removed from the environment**: `ARTEX_PG_DSN`, `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` are unset inside `server.New` after they are read and before the MCP discovery goroutine and the task resume loop start, so agent shells, MCP stdio servers and custom tools spawned afterwards no longer inherit them (#136). The binary passes the option that enables this, but `New` did not apply its options, so the scrub from #136 never ran until #146 fixed it (#146). See Known issues for what this does not cover.
+- **Saved API keys go only to their own endpoint**: `POST /api/llm/test` and `POST /api/llm/models` used a saved key (the profile's, or the global one) for any `base_url` in the request body, so a crafted request could send it to another host. A saved key is now sent only when the request's provider and normalized base URL match the ones it was saved for; otherwise the request must carry `api_key` (#142).
+- **`ARTEX_LLM_PROVIDER` is matched case-insensitively**: `Ollama` or a value with surrounding spaces fell through to the Anthropic default and sent `ANTHROPIC_API_KEY` to the configured base URL (#140).
+
+### Fixed
+
+- **Ollama base URL on the environment path**: `ARTEX_LLM_BASE_URL=http://host:11434` is normalized to the `/v1` root the same way the saved-profile path already was, so a LAN Ollama server configured through the environment no longer answers 404 on chat (direct commit 1c35c9c).
+- **Malformed `config.json` is an error**: `config.Load` used to ignore a parse error and treat the file as missing, which surfaced as a misleading "no database config found" or a silently ignored `skill_dir`. A read or parse error is now returned with the file path and startup exits (#141).
+- **`install.sh` escapes what it writes**: the local install writes `config.json` string values through a JSON escaper and requires a numeric port; the Docker install escapes `\`, `|` and `&` in the Postgres password and API key before the `.env` substitution (#141).
+- **`scripts/backup.sh --keep 0` is rejected**: it used to delete every dump, including the one just written, and still report success. Values with a leading zero are rejected too (#139).
+- **`backups/` is ignored again**: a missing newline had merged it into the previous `.gitignore` line, so database dumps showed up as untracked files (#138).
+
+### Build and CI
+
+- **The image is built from the checkout instead of pulled**: `docker-compose.yml` no longer references the `autumn27/artex` namespace, whose repository is gone and whose name its holder could republish at any time. `install.sh` and `update.sh` build the image locally (direct commit 1ed154e).
+- **A fresh clone builds the image**: the Dockerfile copied a prebuilt `dist/<arch>/artex` that a clean checkout does not have. It is now a multi-stage build: a Node 22 stage runs the frontend static export, a Go 1.26 stage runs `build.sh` with the release binaries job's flags (CGO-free cross-compile, `-trimpath`, version stamp), and the runtime stage copies the result (#147).
+- **`update.sh` refuses to rebuild stale code**: when `git pull --ff-only` fails on a diverged clone (including every clone made before the 2026-10-23 history rewrite), it now stops with recovery commands instead of warning, rebuilding the old tree and printing "Build complete" (direct commit 1ed154e).
+- **CI runs the race detector and shellcheck**: `go test -race -p 1` over every package with tests except `./server`, and `shellcheck -S warning` on `install.sh`, `update.sh`, `start.sh` and `scripts/backup.sh` (#144). The race run uses its own database (direct commit 0477751).
+
+### Upgrades
+
+- **Go 1.26.10** in `go.mod` (was 1.26.3), and **`golang.org/x/net` v0.62.0** (was v0.58.0), which raised x/crypto to 0.58.0, x/text to 0.43.0, x/sys to 0.49.0, x/sync to 0.24.0, x/mod to 0.41.0 and x/tools to 0.51.0 (#145).
+- **Node 22 in the runtime image**: NodeSource `setup_22.x` instead of the end-of-life `setup_20.x`, matching CI and the release workflow (#143).
+
+### Known issues
+
+- **The secret scrub has limits**: `os.Unsetenv` changes only the Go runtime's copy, so a process running as the same user can still read `/proc/<pid>/environ` of the server (and, in Docker, of PID 1, `start.sh`). Other variables that may carry credentials, such as `ARTEX_LLM_PROXY`, are not scrubbed.
+- **The LLM test and model-list endpoints still take `proxy` from the request**, so a saved key can travel through a request-supplied proxy when the base URL is plain HTTP.
+- **Postgres passwords with URL-special characters** (`@`, `/`, `#`, `?`) break the `ARTEX_PG_DSN` that `docker-compose.yml` builds by interpolation, and Compose interpolates `$` in `.env`.
+- **The build context includes local secrets**: `.dockerignore` does not exclude `.env`, `config.json` or `jwt.key`, so the build stage's `COPY . .` puts them in a build-stage layer of the local builder cache. They are not copied into the final image.
+- **Image supply chain**: the recon tools are downloaded at pinned versions but not checksum-verified, sqlmap tracks its default branch, and the Playwright packages are installed at `@latest`. Draft #127 proposes checksum verification.
+- **No Docker image is published for this release**: the release workflow's `docker` job only runs when `DOCKERHUB_ENABLED` is set, and it still downloads prebuilt binaries into `dist/` that the Dockerfile no longer uses. Build the image from the checkout with `docker compose up -d --build`.
+- **CI gaps**: `./server` is not run under `-race`; there is no `govulncheck` step and no `docker build` job. Four tests skip themselves (fresh-database or timing failures, see #9).
+- **Reported and not fixed in this release**: `list_task_credentials` emits an invalid `"required": [""]` schema that strict LLM providers reject (#130), and the MCP Streamable HTTP client fails against servers that only support protocol version 2025-11-25 (#131; fix proposed in #132).
 
 ## [0.4.0] - 2026-10-23
 
@@ -10,7 +79,7 @@ First release of this fork. The engine underneath is still upstream's, but this 
 
 ### Added
 
-- **Recon toolbox in the image**: pinned nuclei, httpx, subfinder, katana, ffuf, dalfox and a sqlmap checkout, verified at build time, so hunt workers can call them directly (#112).
+- **Recon toolbox in the image**: nuclei, httpx, subfinder, katana, ffuf and dalfox installed at release-pinned versions, plus a sqlmap checkout that tracks the default branch, each smoke-tested at build time (run once, not checksum-verified), so hunt workers can call them directly (#112). Checksum verification arrives with #127.
 - **Recursive recon skill** (`bbot-recon`): bbot v3.0.2 in its own virtualenv with module dependencies preinstalled. Policy-gated modes (passive seeds-only when scanners are banned, active-safe, loud only on explicit permission) and JSONL ingestion into the facts graph (#118).
 - **php2shell skill**: turns a file-inclusion finding into verified RCE through the session.upload_progress chain, lab first and gated on program policy (#113).
 - **Code audit and reverse-engineering skills** (#55, #77).
@@ -30,9 +99,10 @@ First release of this fork. The engine underneath is still upstream's, but this 
 - **Planner quiet mode** for less narration during long runs (#81, #88).
 - **Findings discipline**: proof-basis gates, measured impact, adversarial verification and dedup rules decide what a finding must contain before it is reported (#51, #53, #63, #69).
 - **Prompt-injection hardening** on seed material and MCP tool descriptions (#49).
-- **Pause preserves the task timeout budget**, and paused time is frozen in the task clock (#2, #65, #110).
+- **Pause preserves the task timeout budget**, and paused time is frozen in the task clock (#2, #110).
+- **Deadline contract** in the executor seeds (#65).
 - **Task detail metrics and outcome cards** summarise a finished run (#92, #102).
-- **Skill-gap, loop-contract and shadow-lesson reporting** for the planner (#104, #106, #108).
+- **Skill-gap and loop-contract reporting** for the planner (#104, #106); the RSI notes land as documentation in #108.
 
 ### Removed
 
@@ -920,7 +990,9 @@ First release of this fork. The engine underneath is still upstream's, but this 
 - [@Autumn-27](https://github.com/Autumn-27)
 - [@neouks](https://github.com/neouks)
 
-[Unreleased]: https://github.com/BaaRai/ARTEX/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/BaaRai/ARTEX/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/BaaRai/ARTEX/compare/v0.5.0...v0.5.1
+[0.5.0]: https://github.com/BaaRai/ARTEX/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/BaaRai/ARTEX/compare/v0.3.15...v0.4.0
 [0.3.10]: https://github.com/Autumn-27/ARTEX/compare/v0.3.9...v0.3.10
 [0.3.9]: https://github.com/Autumn-27/ARTEX/compare/v0.3.8...v0.3.9
